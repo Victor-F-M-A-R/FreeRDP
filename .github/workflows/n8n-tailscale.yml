@@ -14,21 +14,37 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 🧰 Instalar Tailscale
+      - name: 🔧 Instalar Tailscale via APT (oficial)
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          set -e
+          . /etc/os-release
+          CODENAME="${VERSION_CODENAME}"
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${CODENAME}.tailscale-keyring.list" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y tailscale
 
-      - name: 🔐 Conectar ao Tailnet
+      - name: ♻️ Restaurar estado do Tailscale (fixa o device/IP)
+        uses: actions/cache@v4
+        with:
+          path: /var/lib/tailscale/tailscaled.state
+          key: tailscale-state-v1
+
+      - name: ▶️ Iniciar daemon do Tailscale com estado persistente
+        run: |
+          sudo mkdir -p /var/lib/tailscale
+          sudo nohup tailscaled --state=/var/lib/tailscale/tailscaled.state >/tmp/tailscaled.log 2>&1 &
+
+      - name: 🔐 Conectar ao Tailnet (usa a mesma identidade restaurada)
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           sudo tailscale up \
-            --authkey="${TAILSCALE_AUTH_KEY}" \
-            --hostname="n8n-server" \
+            --authkey "${TAILSCALE_AUTH_KEY}" \
+            --hostname "n8n-server" \
             --accept-routes \
-            --accept-dns \
-            --force-reauth
-          tailscale ip -4
+            --accept-dns
+          echo "Tailscale IPv4: $(tailscale ip -4)"
 
       - name: 🐳 Instalar Docker (se faltar)
         run: |
@@ -37,7 +53,7 @@ jobs:
             sudo usermod -aG docker $USER
           fi
 
-      - name: ♻️ Subir n8n (stateless: tudo no Neon)
+      - name: 🚀 Subir n8n (usa Neon para persistir)
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_PORT: ${{ secrets.DB_PORT }}
@@ -64,9 +80,10 @@ jobs:
             docker.n8n.io/n8nio/n8n:latest
           docker ps
 
-      - name: 🌐 Mostrar URL interna
+      - name: 🌐 Mostrar endereço de acesso
         run: |
-          echo "Acesse via Tailscale: http://n8n-server.tail255505.ts.net:5678"
+          echo "Acesse via MagicDNS (Tailscale):  http://n8n-server.tail255505.ts.net:5678"
+          echo "Ou pelo IPv4 do tailscale acima (porta 5678)."
 
       - name: 💤 Manter vivo por ~5h30
         run: |
