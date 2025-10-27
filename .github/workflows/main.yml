@@ -2,6 +2,11 @@ name: RDP
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"
+concurrency:
+  group: rdp-persistente
+  cancel-in-progress: true
 
 jobs:
   secure-rdp:
@@ -98,16 +103,14 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Maintain Connection (~5h15)
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Address:  $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "Mantendo a sessão ativa por ~5 horas e 15 minutos..."
+          Start-Sleep -Seconds $((5*3600 + 15*60))
+          Write-Host "Encerrando a sessão para reinicialização automática via cron."
+
