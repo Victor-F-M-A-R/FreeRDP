@@ -221,34 +221,58 @@ jobs:
           netsh advfirewall firewall add rule name="Allow node.exe" dir=in action=allow program="$node" enable=yes | Out-Null
 
       # 10) Subir n8n com pm2 + health-check + netstat
-      - name: Start n8n with pm2 (background + healthcheck)
+      - name: Start n8n with pm2 (background + healthcheck) - FIX
         shell: pwsh
         run: |
+          # Exporta .env para o ambiente do processo
           Get-Content -Raw "C:\n8n\.env" | ForEach-Object {
             if ($_ -match '^\s*#') { return }
             if ($_ -match '^\s*$') { return }
             $kv = $_.Split('=',2)
             if ($kv.Length -eq 2) { Set-Item -Path "Env:$($kv[0])" -Value $kv[1] }
           }
+
           npm i -g pm2 --location=global
+          # mata daemon antigo se houver
           pm2 kill | Out-Null
+
+          # Localiza o n8n.cmd instalado globalmente
           $n8nCmd = (Get-Command n8n.cmd -ErrorAction Stop).Source
           Write-Host "n8n.cmd em: $n8nCmd"
-          pm2 start "$n8nCmd" --name n8n -- start
+
+          # Inicia via pm2 forçando o interpretador cmd.exe e passando o argumento "start"
+          # Observação: usamos --interpreter "cmd" e separamos os args com -- (para não confundir pm2)
+          pm2 start "$n8nCmd" --name n8n --interpreter "cmd" -- start
           pm2 save | Out-Null
-          Start-Sleep -Seconds 6
+
+          # Dá um tempinho para subir
+          Start-Sleep -Seconds 8
+
+          # Mostrar status/últimos logs do PM2 para debug
+          Write-Host "=== PM2 LIST ==="
+          pm2 ls
+          Write-Host "=== PM2 SHOW n8n ==="
+          pm2 show n8n || Write-Host "pm2 show falhou ou não existe"
+          Write-Host "=== PM2 LOGS (últimas 200 linhas) ==="
+          pm2 logs n8n --lines 200 --nostream || Write-Host "Não foi possível coletar logs do pm2."
+
+          # Health-check local (porta)
           $ok1 = Test-NetConnection -ComputerName 127.0.0.1 -Port 5678
           Write-Host "Local 127.0.0.1:5678 => TCP: $($ok1.TcpTestSucceeded)"
           try {
             $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:5678/healthz" -TimeoutSec 5
             Write-Host "GET /healthz => $($resp.StatusCode)"
           } catch { Write-Host "GET /healthz falhou: $($_.Exception.Message)" }
+
+          # Health via Tailscale IP (se disponível)
           if ($env:TAILSCALE_IP) {
             $ok2 = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 5678
             Write-Host "$env:TAILSCALE_IP:5678 => TCP: $($ok2.TcpTestSucceeded)"
           }
+
           Write-Host "== LISTENING (5678) =="
-          netstat -ano | findstr ":5678" | findstr "LISTEN"
+          netstat -ano | findstr ":5678" | findstr "LISTEN" || Write-Host "Nenhuma linha LISTEN encontrada para 5678"
+
 
       # 11) Manter vivo até o limite (prints a cada 5 min)
       - name: Keep alive (~6h)
