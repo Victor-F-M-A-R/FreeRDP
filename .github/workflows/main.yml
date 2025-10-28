@@ -147,7 +147,6 @@ jobs:
           }
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP v4 => $tsIP"
-        
       - name: Write RDP creds to file
         shell: pwsh
         run: |
