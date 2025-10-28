@@ -90,41 +90,81 @@ jobs:
           Remove-Item $installerPath -Force
 
       # 5) Subir Tailscale com state fixo + hostname fixo + capturar IP
-      - name: Establish Tailscale Connection (robusto, com retry)
+      - name: Establish Tailscale Connection (unattended + retries)
         shell: pwsh
         env:
           TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path $ts)) { throw "tailscale.exe não encontrado em $ts" }
-          if (-not (Test-Path "C:\tailscale.state")) { New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null }
-          $ok = $false
-          1..3 | ForEach-Object {
-            Write-Host "Tentativa $_/3 para 'tailscale up'…"
+          if (-not (Test-Path $ts)) { throw "tailscale.exe não encontrado em: $ts" }
+
+          # Garante arquivo de state
+          if (-not (Test-Path "C:\tailscale.state")) {
+            New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null
+          }
+
+          # 1) Garante serviço Tailscale rodando
+          try {
+            $svc = Get-Service -Name Tailscale -ErrorAction Stop
+            if ($svc.Status -ne 'Running') {
+              Start-Service -Name Tailscale
+              Start-Sleep -Seconds 3
+            }
+          } catch {
+            Write-Host "Serviço 'Tailscale' não encontrado ou não iniciou ainda. Tentando iniciar via sc..."
+            sc.exe start Tailscale | Out-Null
+            Start-Sleep -Seconds 3
+          }
+
+          function Try-Up {
+            param([int]$Attempt)
+            Write-Host ">>> tailscale up (tentativa $Attempt)..."
             & $ts up `
               --authkey="$env:TS_AUTH" `
               --state="C:\tailscale.state" `
               --hostname="n8n-server" `
               --accept-dns=true `
-              --accept-routes=true 2>&1 | Tee-Object -FilePath C:\tailscale_up.log
-            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
-            Start-Sleep -Seconds 5
+              --accept-routes=true `
+              --unattended=true 2>&1 | Tee-Object -FilePath C:\tailscale_up.log
+            return $LASTEXITCODE
           }
-          if (-not $ok) {
-            Write-Host "===== LOG tailscale_up.log ====="
+
+          $exit = Try-Up -Attempt 1
+          if ($exit -ne 0) {
+            Write-Host "tailscale up falhou (1). Reiniciando serviço e tentando novamente..."
+            try { Restart-Service -Name Tailscale -Force -ErrorAction SilentlyContinue } catch {}
+            Start-Sleep -Seconds 5
+            $exit = Try-Up -Attempt 2
+          }
+
+          if ($exit -ne 0) {
+            Write-Host "tailscale up falhou (2). Fazendo logout e última tentativa..."
+            & $ts logout || $true
+            Start-Sleep -Seconds 3
+            # Serviço pode ter parado após logout; sobe de novo
+            try { Start-Service -Name Tailscale -ErrorAction SilentlyContinue } catch {}
+            Start-Sleep -Seconds 3
+            $exit = Try-Up -Attempt 3
+          }
+
+          if ($exit -ne 0) {
+            Write-Host "===== LOG tailscale_up.log (últimas 200 linhas) ====="
             Get-Content C:\tailscale_up.log -ErrorAction SilentlyContinue | Select-Object -Last 200
+            Write-Host "===== tailscale status ====="
+            & $ts status || $true
             throw "tailscale up falhou após 3 tentativas."
           }
+
+          # OK: captura IP v4 e exporta
           $tsIP = & $ts ip -4
           if (-not $tsIP) {
-            Write-Host "===== LOG tailscale status ====="
+            Write-Host "===== tailscale status ====="
             & $ts status || $true
-            throw "Tailscale IP não retornou."
+            throw "Tailscale IP não retornou após 'up' bem-sucedido."
           }
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP v4 => $tsIP"
-
       # 6) Salvar state (ignorar falha de reserva do cache)
       - name: Save Tailscale state (cache)
         uses: actions/cache/save@v4
