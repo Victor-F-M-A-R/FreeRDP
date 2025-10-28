@@ -15,9 +15,7 @@ jobs:
     timeout-minutes: 360   # 6h é o limite do runner hosted
 
     steps:
-      #######################################################################
       # 0) Restaurar state do Tailscale (cache)
-      #######################################################################
       - name: Restore Tailscale state (cache)
         uses: actions/cache/restore@v4
         continue-on-error: true
@@ -25,9 +23,7 @@ jobs:
           path: C:\tailscale.state
           key: tailscale-state-v1
 
-      #######################################################################
       # 1) RDP básico + firewall porta 3389
-      #######################################################################
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
@@ -38,9 +34,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Restart-Service -Name TermService -Force
 
-      #######################################################################
       # 2) Criar/atualizar usuário RDP com senha forte
-      #######################################################################
       - name: Create/Update RDP user
         shell: pwsh
         run: |
@@ -55,10 +49,7 @@ jobs:
           $raw += $Number| Get-Random -Count 4
           $raw += $Special| Get-Random -Count 4
           $pwd = -join ($raw | Sort-Object { Get-Random })
-
-          # Mascara a senha nos logs
           Write-Output "::add-mask::$pwd"
-
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires
@@ -67,33 +58,28 @@ jobs:
           }
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-
-          "RDP_USER=RDP"                  | Out-File -FilePath $env:GITHUB_ENV -Append
-          "RDP_PASS=$pwd"                 | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RDP_USER=RDP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RDP_PASS=$pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
           "RDP_CREDS=User: RDP | Password: $pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
-  
-  name: Sanity check (secrets & rede)
-  shell: pwsh
-  env:
-    TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
-  run: |
-    $ErrorActionPreference = "Stop"
 
-    if (-not $env:TS_AUTH) {
-      throw "Falta o secret TAILSCALE_AUTH_KEY. Vá em Settings → Secrets and variables → Actions e crie/cole sua tskey-…"
-    }
+      # 3) Sanity check (secret + rede)  <<< ESTE FICA DENTRO DE steps!
+      - name: Sanity check (secrets & rede)
+        shell: pwsh
+        env:
+          TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:TS_AUTH) {
+            throw "Falta o secret TAILSCALE_AUTH_KEY. Vá em Settings → Secrets and variables → Actions e crie/cole sua tskey-…"
+          }
+          try {
+            [System.Net.Dns]::GetHostAddresses("pkgs.tailscale.com") | Out-Null
+            Write-Host "DNS OK para pkgs.tailscale.com"
+          } catch {
+            throw "DNS falhou: $($_.Exception.Message)"
+          }
 
-    Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
-    Write-Host "Testando DNS para pkgs.tailscale.com…"
-    try {
-      [System.Net.Dns]::GetHostAddresses("pkgs.tailscale.com") | Out-Null
-      Write-Host "DNS OK"
-    } catch {
-      throw "DNS falhou: $($_.Exception.Message)"
-    }
-  #######################################################################
-      # 3) Instalar Tailscale (MSI)
-  #######################################################################
+      # 4) Instalar Tailscale (MSI)
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -103,20 +89,7 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      #######################################################################
-      # 4) Subir Tailscale com state fixo + hostname fixo + capturar IP
-      #######################################################################
-      - name: Sanity check (secrets & ambiente)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if (-not $env:{{ secrets.TAILSCALE_AUTH_KEY }} -and -not $env:TS_AUTH) {
-            Write-Error "Falta o secret TAILSCALE_AUTH_KEY. Vá em Settings → Secrets → Actions e crie/cole sua tskey-…"
-          }
-          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
-          Write-Host "NET OK? Testando DNS…"
-          try { [System.Net.Dns]::GetHostAddresses("pkgs.tailscale.com") | Out-Null; Write-Host "DNS OK" } catch { Write-Host "DNS falhou: $($_.Exception.Message)" }
-
+      # 5) Subir Tailscale com state fixo + hostname fixo + capturar IP
       - name: Establish Tailscale Connection (robusto, com retry)
         shell: pwsh
         env:
@@ -125,11 +98,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $ts)) { throw "tailscale.exe não encontrado em $ts" }
-
-          if (-not (Test-Path "C:\tailscale.state")) {
-            New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null
-          }
-
+          if (-not (Test-Path "C:\tailscale.state")) { New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null }
           $ok = $false
           1..3 | ForEach-Object {
             Write-Host "Tentativa $_/3 para 'tailscale up'…"
@@ -139,18 +108,14 @@ jobs:
               --hostname="n8n-server" `
               --accept-dns=true `
               --accept-routes=true 2>&1 | Tee-Object -FilePath C:\tailscale_up.log
-
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
             Start-Sleep -Seconds 5
           }
-
           if (-not $ok) {
             Write-Host "===== LOG tailscale_up.log ====="
             Get-Content C:\tailscale_up.log -ErrorAction SilentlyContinue | Select-Object -Last 200
             throw "tailscale up falhou após 3 tentativas."
           }
-
-          # Capturar IP v4 e exportar
           $tsIP = & $ts ip -4
           if (-not $tsIP) {
             Write-Host "===== LOG tailscale status ====="
@@ -160,7 +125,7 @@ jobs:
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP v4 => $tsIP"
 
-      # Salvar state (não falhar se concorrência travar o cache)
+      # 6) Salvar state (ignorar falha de reserva do cache)
       - name: Save Tailscale state (cache)
         uses: actions/cache/save@v4
         continue-on-error: true
@@ -168,9 +133,7 @@ jobs:
           path: C:\tailscale.state
           key: tailscale-state-v1
 
-      #######################################################################
-      # 5) Preparar pastas do n8n + liberar porta 5678
-      #######################################################################
+      # 7) Pastas do n8n + liberar porta 5678
       - name: Prepare n8n folder + firewall by port
         shell: pwsh
         run: |
@@ -179,9 +142,7 @@ jobs:
           netsh advfirewall firewall delete rule name="n8n-5678" | Out-Null
           netsh advfirewall firewall add rule name="n8n-5678" dir=in action=allow protocol=TCP localport=5678 | Out-Null
 
-      #######################################################################
-      # 6) Escrever .env do n8n (com bind em 0.0.0.0 e seus dados de DB/credenciais)
-      #######################################################################
+      # 8) .env do n8n (bind 0.0.0.0 e suas credenciais)
       - name: Create .env for n8n
         shell: pwsh
         run: |
@@ -209,7 +170,7 @@ jobs:
           Set-Content -Path 'C:\n8n\.env' -Value $lines -Encoding UTF8
           Write-Host 'C:\n8n\.env criado.'
 
-      # (Opcional) Ver o .env nos logs para conferência
+      # (debug opcional)
       - name: Show .env (debug)
         shell: pwsh
         run: |
@@ -217,9 +178,7 @@ jobs:
           Get-Content -Path 'C:\n8n\.env'
           Write-Host "======================="
 
-      #######################################################################
-      # 7) Node 20 + n8n global
-      #######################################################################
+      # 9) Node 20 + n8n global
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
@@ -227,12 +186,9 @@ jobs:
 
       - name: Install n8n globally
         shell: pwsh
-        run: |
-          npm install -g n8n
+        run: npm install -g n8n
 
-      #######################################################################
-      # 8) Liberar o processo node.exe no firewall (além da porta)
-      #######################################################################
+      # 10) Liberar o processo node.exe no firewall
       - name: Allow node.exe in Windows Firewall
         shell: pwsh
         run: |
@@ -241,50 +197,37 @@ jobs:
           netsh advfirewall firewall delete rule name="Allow node.exe" | Out-Null
           netsh advfirewall firewall add rule name="Allow node.exe" dir=in action=allow program="$node" enable=yes | Out-Null
 
-      #######################################################################
-      # 9) Subir n8n com pm2 + health-check + netstat
-      #######################################################################
+      # 11) Subir n8n com pm2 + health-check + netstat
       - name: Start n8n with pm2 (background + healthcheck)
         shell: pwsh
         run: |
-          # Exporta .env para este processo
           Get-Content -Raw "C:\n8n\.env" | ForEach-Object {
             if ($_ -match '^\s*#') { return }
             if ($_ -match '^\s*$') { return }
             $kv = $_.Split('=',2)
             if ($kv.Length -eq 2) { Set-Item -Path "Env:$($kv[0])" -Value $kv[1] }
           }
-
           npm i -g pm2 --location=global
           pm2 kill | Out-Null
-
           $n8nCmd = (Get-Command n8n.cmd -ErrorAction Stop).Source
           Write-Host "n8n.cmd em: $n8nCmd"
-
           pm2 start "$n8nCmd" --name n8n -- start
           pm2 save | Out-Null
           Start-Sleep -Seconds 6
-
-          # Health local
           $ok1 = Test-NetConnection -ComputerName 127.0.0.1 -Port 5678
           Write-Host "Local 127.0.0.1:5678 => TCP: $($ok1.TcpTestSucceeded)"
           try {
             $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:5678/healthz" -TimeoutSec 5
             Write-Host "GET /healthz => $($resp.StatusCode)"
           } catch { Write-Host "GET /healthz falhou: $($_.Exception.Message)" }
-
-          # Health via Tailscale
           if ($env:TAILSCALE_IP) {
             $ok2 = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 5678
             Write-Host "$env:TAILSCALE_IP:5678 => TCP: $($ok2.TcpTestSucceeded)"
           }
-
           Write-Host "== LISTENING (5678) =="
           netstat -ano | findstr ":5678" | findstr "LISTEN"
 
-      #######################################################################
-      # 10) Manter vivo até o limite (prints a cada 5 min)
-      #######################################################################
+      # 12) Manter vivo até o limite (prints a cada 5 min)
       - name: Keep alive (~6h)
         shell: pwsh
         run: |
@@ -292,7 +235,6 @@ jobs:
           Write-Host "RDP  -> $env:TAILSCALE_IP:3389  (User: $env:RDP_USER | Password: $env:RDP_PASS)"
           Write-Host "n8n  -> http://n8n-server.tail255505.ts.net:5678  (ou http://$env:TAILSCALE_IP:5678)"
           Write-Host "=====================`n"
-
           for ($i=0; $i -lt 72; $i++) {
             Write-Host "[$(Get-Date)] Runner ativo. n8n em 5678. Tailscale $env:TAILSCALE_IP"
             Start-Sleep -Seconds 300
