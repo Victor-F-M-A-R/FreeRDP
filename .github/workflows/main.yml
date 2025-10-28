@@ -72,9 +72,28 @@ jobs:
           "RDP_PASS=$pwd"                 | Out-File -FilePath $env:GITHUB_ENV -Append
           "RDP_CREDS=User: RDP | Password: $pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      #######################################################################
+- name: Sanity check (secrets & rede)
+  shell: pwsh
+  env:
+    TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
+  run: |
+    $ErrorActionPreference = "Stop"
+
+    if (-not $env:TS_AUTH) {
+      throw "Falta o secret TAILSCALE_AUTH_KEY. Vá em Settings → Secrets and variables → Actions e crie/cole sua tskey-…"
+    }
+
+    Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+    Write-Host "Testando DNS para pkgs.tailscale.com…"
+    try {
+      [System.Net.Dns]::GetHostAddresses("pkgs.tailscale.com") | Out-Null
+      Write-Host "DNS OK"
+    } catch {
+      throw "DNS falhou: $($_.Exception.Message)"
+    }
+  #######################################################################
       # 3) Instalar Tailscale (MSI)
-      #######################################################################
+  #######################################################################
       - name: Install Tailscale
         shell: pwsh
         run: |
