@@ -2,8 +2,9 @@ name: RDP + n8n (Windows runner)
 
 on:
   workflow_dispatch:
-schedule:
-  - cron: "0 */6 * * *"
+  schedule:
+    - cron: "0 */6 * * *"
+
 concurrency:
   group: rdp-n8n-persistente
   cancel-in-progress: true
@@ -20,6 +21,8 @@ jobs:
         with:
           path: C:\tailscale.state
           key: tailscale-state-v1
+          restore-keys: |
+            tailscale-state-
 
       # 1) RDP + firewall
       - name: Configure Core RDP Settings
@@ -28,9 +31,9 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
-          netsh advfirewall firewall delete rule name='RDP-Tailscale' | Out-Null
+          netsh advfirewall firewall delete rule name='RDP-Tailscale' 2>$null | Out-Null
           netsh advfirewall firewall add rule name='RDP-Tailscale' dir=in action=allow protocol=TCP localport=3389 | Out-Null
-          Restart-Service -Name TermService -Force
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
 
       # 2) Usuário RDP
       - name: Create RDP User with Secure Password
@@ -41,21 +44,29 @@ jobs:
           $raw=@();$raw+=$U|Get-Random -Count 4;$raw+=$L|Get-Random -Count 4;$raw+=$N|Get-Random -Count 4;$raw+=$S|Get-Random -Count 4
           $pwd = -join ($raw | Sort-Object { Get-Random })
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
-          if (-not (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue)) { New-LocalUser -Name 'RDP' -Password $sec -AccountNeverExpires } else { Set-LocalUser -Name 'RDP' -Password $sec }
+          if (-not (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue)) { 
+            New-LocalUser -Name 'RDP' -Password $sec -AccountNeverExpires 
+          } else { 
+            Set-LocalUser -Name 'RDP' -Password $sec 
+          }
           Add-LocalGroupMember -Group 'Administrators' -Member 'RDP' -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' -ErrorAction SilentlyContinue
-          "RDP_CREDS=User: RDP | Password: $pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "=== RDP ACCESS ==="; Write-Host "User: RDP"; Write-Host "Pass: $pwd"
+          echo "RDP_PASSWORD=$pwd" >> $env:GITHUB_ENV
+          Write-Host "=== RDP ACCESS ===" 
+          Write-Host "User: RDP" 
+          Write-Host "Pass: $pwd"
 
       # 3) Tailscale MSI
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi'
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
           $msi = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $url -OutFile $msi
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/quiet', '/norestart' -Wait
           Remove-Item $msi -Force
+          Start-Sleep -Seconds 10
 
       # 4) Tailscale up com state + hostname fixo
       - name: Establish Tailscale Connection
@@ -64,81 +75,136 @@ jobs:
           TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path 'C:\tailscale.state')) { New-Item -ItemType File -Path 'C:\tailscale.state' | Out-Null }
-          & $ts up --authkey="$env:TS_AUTH" --state='C:\tailscale.state' --hostname='n8n-server' --accept-dns=true --accept-routes=true
+          if (-not (Test-Path 'C:\tailscale.state')) { 
+            New-Item -ItemType File -Path 'C:\tailscale.state' -Force | Out-Null 
+          }
+          Start-Sleep -Seconds 5
+          & $ts up --authkey="$env:TS_AUTH" --statefile='C:\tailscale.state' --hostname='n8n-server' --accept-dns=true --accept-routes=true
+          Start-Sleep -Seconds 10
           $ip = & $ts ip -4
-          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
           Write-Host "Tailscale IP: $ip"
 
       # 5) Salvar/atualizar o state no cache
       - name: Save Tailscale state (cache)
         uses: actions/cache/save@v4
+        if: always()
         with:
           path: C:\tailscale.state
-          key: tailscale-state-v1
+          key: tailscale-state-v1-${{ github.run_id }}
 
       # 6) Pasta e firewall do n8n
       - name: Prepare n8n folder and firewall
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path 'C:\n8n' -ErrorAction SilentlyContinue | Out-Null
-          New-Item -ItemType Directory -Path 'C:\n8n\data' -ErrorAction SilentlyContinue | Out-Null
-          netsh advfirewall firewall delete rule name='n8n-5678' | Out-Null
+          New-Item -ItemType Directory -Path 'C:\n8n' -Force | Out-Null
+          New-Item -ItemType Directory -Path 'C:\n8n\data' -Force | Out-Null
+          New-Item -ItemType Directory -Path 'C:\n8n\.n8n' -Force | Out-Null
+          netsh advfirewall firewall delete rule name='n8n-5678' 2>$null | Out-Null
           netsh advfirewall firewall add rule name='n8n-5678' dir=in action=allow protocol=TCP localport=5678 | Out-Null
 
-      # 7) .env do n8n (sem here-string → menos chance de erro YAML)
+      # 7) .env do n8n
       - name: Create .env for n8n
         shell: pwsh
         run: |
-          $lines = @(
-            'N8N_BASIC_AUTH_ACTIVE=true',
-            'N8N_BASIC_AUTH_USER=n8nadmin',
-            'N8N_BASIC_AUTH_PASSWORD=HyIkL9hC0fQtFzN91',
-            'N8N_ENCRYPTION_KEY=7e5ba0b2d6a24c4483c891079f5004f4ac6b0e83678648a6b3ed11f3f6abcb56',
-            'GENERIC_TIMEZONE=America/Sao_Paulo',
-            'WEBHOOK_URL=http://n8n-server.tail255505.ts.net:5678',
-            'DB_TYPE=postgresdb',
-            'DB_POSTGRESDB_HOST=ep-bold-rain-ad0gbdv3-pooler.c-2.us-east-1.aws.neon.tech',
-            'DB_POSTGRESDB_PORT=5432',
-            'DB_POSTGRESDB_DATABASE=neondb',
-            'DB_POSTGRESDB_USER=neondb_owner',
-            'DB_POSTGRESDB_PASSWORD=npg_7sq8cUgWAmwh',
-            'DB_POSTGRESDB_SSL_ENABLED=true',
-            'DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false'
-          )
-          Set-Content -Path 'C:\n8n\.env' -Value $lines -Encoding UTF8
-          Write-Host 'C:\n8n\.env criado.'
+          $envContent = @"
+          N8N_BASIC_AUTH_ACTIVE=true
+          N8N_BASIC_AUTH_USER=n8nadmin
+          N8N_BASIC_AUTH_PASSWORD=HyIkL9hC0fQtFzN91
+          N8N_ENCRYPTION_KEY=7e5ba0b2d6a24c4483c891079f5004f4ac6b0e83678648a6b3ed11f3f6abcb56
+          GENERIC_TIMEZONE=America/Sao_Paulo
+          WEBHOOK_URL=http://n8n-server.tail255505.ts.net:5678
+          N8N_HOST=0.0.0.0
+          N8N_PORT=5678
+          N8N_PROTOCOL=http
+          N8N_USER_FOLDER=C:\n8n\.n8n
+          DB_TYPE=postgresdb
+          DB_POSTGRESDB_HOST=ep-bold-rain-ad0gbdv3-pooler.c-2.us-east-1.aws.neon.tech
+          DB_POSTGRESDB_PORT=5432
+          DB_POSTGRESDB_DATABASE=neondb
+          DB_POSTGRESDB_USER=neondb_owner
+          DB_POSTGRESDB_PASSWORD=npg_7sq8cUgWAmwh
+          DB_POSTGRESDB_SSL_ENABLED=true
+          DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false
+          "@
+          $envContent | Out-File -FilePath 'C:\n8n\.env' -Encoding UTF8
+          Write-Host 'C:\n8n\.env criado com sucesso.'
 
       # 8) Node + n8n (sem Docker)
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          
       - name: Install n8n globally
         shell: pwsh
-        run: npm install -g n8n
+        run: |
+          npm install -g n8n --unsafe-perm=true
+          npm list -g n8n
 
       # 9) Start n8n em background
       - name: Start n8n
         shell: pwsh
         run: |
+          # Carregar variáveis do .env
           Get-Content -Path 'C:\n8n\.env' | ForEach-Object {
             if ($_ -and -not $_.StartsWith('#')) {
-              $k = ($_ -split '=',2)[0]; $v = ($_ -split '=',2)[1]
-              if ($k -and $v) { Set-Item -Path "Env:$k" -Value $v }
+              $line = $_.Trim()
+              if ($line -match '^([^=]+)=(.*)$') {
+                $key = $matches[1].Trim()
+                $value = $matches[2].Trim()
+                [Environment]::SetEnvironmentVariable($key, $value, 'Process')
+              }
             }
           }
-          Start-Process -NoNewWindow -FilePath 'n8n.cmd' -ArgumentList 'start' -WorkingDirectory 'C:\n8n'
+          
+          # Definir variáveis adicionais
+          $env:N8N_USER_FOLDER = 'C:\n8n\.n8n'
+          $env:N8N_HOST = '0.0.0.0'
+          $env:N8N_PORT = '5678'
+          
+          # Iniciar n8n como job em background
+          $job = Start-Job -ScriptBlock {
+            Set-Location 'C:\n8n'
+            n8n start
+          }
+          
+          Write-Host "n8n iniciado com Job ID: $($job.Id)"
+          Start-Sleep -Seconds 30
+          
+          # Verificar se n8n está rodando
+          try {
+            $response = Invoke-WebRequest -Uri 'http://localhost:5678' -UseBasicParsing -TimeoutSec 10
+            Write-Host "✅ n8n está rodando na porta 5678"
+          } catch {
+            Write-Host "⚠️ n8n pode estar inicializando ainda..."
+          }
 
       # 10) Keep alive até ~6h
       - name: Keep alive (~6h)
         shell: pwsh
         run: |
           Write-Host "`n=== ACCESS INFO ==="
-          Write-Host "RDP -> $env:TAILSCALE_IP:3389  (User: RDP | Password: $env:RDP_CREDS)"
+          Write-Host "RDP -> ${env:TAILSCALE_IP}:3389  (User: RDP | Password: ${env:RDP_PASSWORD})"
           Write-Host "n8n -> http://n8n-server.tail255505.ts.net:5678"
+          Write-Host "n8n Local -> http://localhost:5678"
+          Write-Host "n8n Credentials -> User: n8nadmin | Password: HyIkL9hC0fQtFzN91"
           Write-Host "=====================`n"
+          
+          $startTime = Get-Date
           for ($i=0; $i -lt 72; $i++) {
-            Write-Host "[$(Get-Date)] Runner ativo. n8n em 5678. Tailscale $env:TAILSCALE_IP"
+            $elapsed = ((Get-Date) - $startTime).ToString("hh\:mm\:ss")
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Runner ativo há $elapsed. n8n em 5678. Tailscale ${env:TAILSCALE_IP}"
+            
+            # Verificar status do n8n a cada 5 iterações
+            if ($i % 5 -eq 0) {
+              try {
+                $null = Invoke-WebRequest -Uri 'http://localhost:5678/healthz' -UseBasicParsing -TimeoutSec 5
+                Write-Host "  ✅ n8n está respondendo"
+              } catch {
+                Write-Host "  ⚠️ n8n não respondeu ao health check"
+              }
+            }
+            
             Start-Sleep -Seconds 300
           }
