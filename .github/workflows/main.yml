@@ -2,62 +2,69 @@ name: RDP
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */5 * * *"   # roda a cada 5 horas
+  # Se quiser religar sozinho a cada 6h, descomente abaixo e ajuste
+   schedule:
+     - cron: "0 */6 * * *"
 
 concurrency:
-  group: rdp-persistente
+  group: rdp-n8n-persistente
   cancel-in-progress: true
 
 jobs:
-  secure-rdp:
+  secure-rdp-and-n8n:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360   # ~6h é o limite do Windows runner
 
     steps:
-      - name: Configure Core RDP Settings
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" >NUL 2>&1
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
-          $raw = @()
-          $raw += $charSet.Upper   | Get-Random -Count 4
-          $raw += $charSet.Lower   | Get-Random -Count 4
-          $raw += $charSet.Number  | Get-Random -Count 4
-          $raw += $charSet.Special | Get-Random -Count 4
-          $password  = -join ($raw | Sort-Object { Get-Random })
-          $secure    = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          }
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-
-      # 1) RESTAURA o cache onde guardamos o Registro do Tailscale
+      # 0) Restaurar o state do Tailscale do cache (para manter o mesmo nó/IP)
       - name: Restore Tailscale state (cache)
         uses: actions/cache/restore@v4
         with:
-          path: C:\tsstate
-          key: tailscale-state-win-v1
+          path: C:\tailscale.state
+          key: tailscale-state-v1
 
+      # 1) Habilitar RDP e regras de firewall básicas
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          Restart-Service -Name TermService -Force
+
+      # 2) Criar usuário RDP (admin) com senha aleatória (mostra no log)
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Security
+          $Upper   = [char[]](65..90)
+          $Lower   = [char[]](97..122)
+          $Number  = [char[]](48..57)
+          $Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          $raw = @()
+          $raw += $Upper | Get-Random -Count 4
+          $raw += $Lower | Get-Random -Count 4
+          $raw += $Number| Get-Random -Count 4
+          $raw += $Special| Get-Random -Count 4
+          $pwd = -join ($raw | Sort-Object { Get-Random })
+          $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name "RDP" -Password $sec
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          "RDP_CREDS=User: RDP | Password: $pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Username: RDP"
+          Write-Host "Password: $pwd"
+
+      # 3) Instalar Tailscale (Windows MSI)
       - name: Install Tailscale
+        shell: pwsh
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
@@ -65,63 +72,103 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      # 2) IMPORTA o Registro salvo (se existir) antes do 'tailscale up'
-      - name: Import Tailscale machine state (Registry)
+      # 4) Subir Tailscale usando o state do cache (IP/identidade persistem) + hostname fixo
+      - name: Establish Tailscale Connection
         shell: pwsh
-        run: |
-          if (Test-Path C:\tsstate\ts.reg) {
-            reg import C:\tsstate\ts.reg
-            Write-Host "Tailscale machine state imported from cache."
-          } else {
-            Write-Host "No cached Tailscale state yet (first run)."
-          }
-
-      - name: Establish Tailscale Connection (fixed hostname)
+        env:
+          TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-                   --hostname=n8n-server `
-                   --accept-routes --accept-dns
-          # aguarda IP
-          $tsIP = $null; $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-            $tsIP = & $ts ip -4
-            Start-Sleep -Seconds 5
-            $retries++
+          if (-not (Test-Path "C:\tailscale.state")) {
+            New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null
           }
-          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IPv4: $tsIP"
+          & $ts up `
+            --authkey="$env:TS_AUTH" `
+            --state="C:\tailscale.state" `
+            --hostname="n8n-server" `
+            --accept-dns=true `
+            --accept-routes=true
 
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $ok = (Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389).TcpTestSucceeded
-          if (-not $ok) { Write-Error "TCP connection to 3389 failed"; exit 1 }
-          Write-Host "TCP connectivity successful!"
+          # Capturar IP e exibir
+          $tsIP = & $ts ip -4
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale IP: $tsIP"
 
-      # 3) EXPORTA o Registro e SALVA no cache para a próxima execução
-      - name: Export Tailscale machine state (Registry)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path C:\tsstate | Out-Null
-          reg export "HKLM\SOFTWARE\Tailscale IPN" C:\tsstate\ts.reg /y
-          Write-Host "Tailscale machine state exported to C:\tsstate\ts.reg"
-
+      # 5) Salvar/atualizar o state do Tailscale no cache
       - name: Save Tailscale state (cache)
         uses: actions/cache/save@v4
         with:
-          path: C:\tsstate
-          key: tailscale-state-win-v1
+          path: C:\tailscale.state
+          key: tailscale-state-v1
 
-      # Mantém a sessão até o próximo cron (24/7)
-      - name: Maintain Connection (~5h15)
+      # 6) Abrir porta 5678 pro n8n e criar C:\n8n
+      - name: Prepare n8n folder and firewall
+        shell: pwsh
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          Write-Host "Mantendo a sessão ativa por ~5 horas e 15 minutos..."
-          Start-Sleep -Seconds $((5*3600 + 15*60))
-          Write-Host "Encerrando a sessão para reinicialização automática via cron."
+          New-Item -ItemType Directory -Path "C:\n8n" -ErrorAction SilentlyContinue | Out-Null
+          New-Item -ItemType Directory -Path "C:\n8n\data" -ErrorAction SilentlyContinue | Out-Null
+          netsh advfirewall firewall delete rule name="n8n-5678" | Out-Null
+          netsh advfirewall firewall add rule name="n8n-5678" dir=in action=allow protocol=TCP localport=5678 | Out-Null
+
+      # 7) Criar o arquivo .env com seus dados (Neon + auth + encryption)
+      - name: Create .env for n8n
+        shell: pwsh
+        run: |
+          $envContent = @"
+# n8n
+N8N_BASIC_AUTH_ACTIVE=true
+N8N_BASIC_AUTH_USER=n8nadmin
+N8N_BASIC_AUTH_PASSWORD=HyIkL9hC0fQtFzN91
+N8N_ENCRYPTION_KEY=7e5ba0b2d6a24c4483c891079f5004f4ac6b0e83678648a6b3ed11f3f6abcb56
+GENERIC_TIMEZONE=America/Sao_Paulo
+WEBHOOK_URL=http://n8n-server.tail255505.ts.net:5678
+
+# Postgres (Neon)
+DB_TYPE=postgresdb
+DB_POSTGRESDB_HOST=ep-bold-rain-ad0gbdv3-pooler.c-2.us-east-1.aws.neon.tech
+DB_POSTGRESDB_PORT=5432
+DB_POSTGRESDB_DATABASE=neondb
+DB_POSTGRESDB_USER=neondb_owner
+DB_POSTGRESDB_PASSWORD=npg_7sq8cUgWAmwh
+
+# SSL Neon
+DB_POSTGRESDB_SSL_ENABLED=true
+DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false
+"@
+          Set-Content -Path "C:\n8n\.env" -Value $envContent -Encoding UTF8
+          Write-Host "C:\n8n\.env criado."
+
+      # 8) Instalar Node 20.x e n8n global (sem Docker)
+      - name: Install Node.js and n8n
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install n8n globally
+        shell: pwsh
+        run: |
+          npm install -g n8n
+
+      # 9) Iniciar n8n em background carregando o .env
+      - name: Start n8n
+        shell: pwsh
+        run: |
+          $envVars = Get-Content -Raw "C:\n8n\.env" `
+            | Select-String -Pattern '^[^#\r\n]+' -AllMatches `
+            | ForEach-Object { $_.Matches.Value.Split('=') } `
+            | ForEach-Object { Set-Item -Path "Env:$($_[0])" -Value ($_.Slice(1) -join "=") }
+
+          # inicia em background
+          Start-Process -NoNewWindow -FilePath "n8n.cmd" -ArgumentList "start" -WorkingDirectory "C:\n8n"
+
+      # 10) Mostrar como acessar e manter job vivo até o limite (~6h)
+      - name: Keep alive (~6h)
+        shell: pwsh
+        run: |
+          Write-Host "`n=== ACCESS INFO ==="
+          Write-Host "RDP -> $env:TAILSCALE_IP:3389 (User: RDP | Password: $env:RDP_CREDS)"
+          Write-Host "n8n -> http://n8n-server.tail255505.ts.net:5678"
+          Write-Host "=====================`n"
+          for ($i=0; $i -lt 72; $i++) {
+            Write-Host "[$(Get-Date)] Runner ativo. n8n em 5678. Tailscale $env:TAILSCALE_IP"
+            Start-Sleep -Seconds 300
+          }
