@@ -175,6 +175,19 @@ jobs:
 
           Start-Process -NoNewWindow -FilePath $n8nCmd -ArgumentList "start" -WorkingDirectory "C:\n8n"
 
+        - name: Health check n8n local
+        shell: pwsh
+        run: |
+          Write-Host "Testando porta 5678 local..."
+          $t = Test-NetConnection -ComputerName 127.0.0.1 -Port 5678
+          $t | Format-List
+          if (-not $t.TcpTestSucceeded) { Write-Error "n8n NÃO está ouvindo localmente na porta 5678"; exit 1 }
+          try {
+            $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5678 -TimeoutSec 5
+            Write-Host "HTTP local OK -> StatusCode: $($r.StatusCode)"
+          } catch {
+            Write-Warning "Conseguiu abrir TCP, mas HTTP falhou (pode ser só página inicial sem resposta)."
+          }
       # ---------- Keep alive ----------
       - name: Keep alive (~6h)
         shell: pwsh
