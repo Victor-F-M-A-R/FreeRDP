@@ -87,25 +87,57 @@ jobs:
       #######################################################################
       # 4) Subir Tailscale com state fixo + hostname fixo + capturar IP
       #######################################################################
-      - name: Establish Tailscale Connection
+      - name: Sanity check (secrets & ambiente)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:{{ secrets.TAILSCALE_AUTH_KEY }} -and -not $env:TS_AUTH) {
+            Write-Error "Falta o secret TAILSCALE_AUTH_KEY. Vá em Settings → Secrets → Actions e crie/cole sua tskey-…"
+          }
+          Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+          Write-Host "NET OK? Testando DNS…"
+          try { [System.Net.Dns]::GetHostAddresses("pkgs.tailscale.com") | Out-Null; Write-Host "DNS OK" } catch { Write-Host "DNS falhou: $($_.Exception.Message)" }
+
+      - name: Establish Tailscale Connection (robusto, com retry)
         shell: pwsh
         env:
           TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          $ErrorActionPreference = "Stop"
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) { throw "tailscale.exe não encontrado em $ts" }
+
           if (-not (Test-Path "C:\tailscale.state")) {
             New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null
           }
 
-          & $ts up `
-            --authkey="$env:TS_AUTH" `
-            --state="C:\tailscale.state" `
-            --hostname="n8n-server" `
-            --accept-dns=true `
-            --accept-routes=true
+          $ok = $false
+          1..3 | ForEach-Object {
+            Write-Host "Tentativa $_/3 para 'tailscale up'…"
+            & $ts up `
+              --authkey="$env:TS_AUTH" `
+              --state="C:\tailscale.state" `
+              --hostname="n8n-server" `
+              --accept-dns=true `
+              --accept-routes=true 2>&1 | Tee-Object -FilePath C:\tailscale_up.log
 
-          # Captura IP v4 e exporta
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ok) {
+            Write-Host "===== LOG tailscale_up.log ====="
+            Get-Content C:\tailscale_up.log -ErrorAction SilentlyContinue | Select-Object -Last 200
+            throw "tailscale up falhou após 3 tentativas."
+          }
+
+          # Capturar IP v4 e exportar
           $tsIP = & $ts ip -4
+          if (-not $tsIP) {
+            Write-Host "===== LOG tailscale status ====="
+            & $ts status || $true
+            throw "Tailscale IP não retornou."
+          }
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP v4 => $tsIP"
 
