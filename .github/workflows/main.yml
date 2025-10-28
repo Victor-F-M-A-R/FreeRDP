@@ -1,9 +1,9 @@
-name: RDP + n8n (persistente)
+name: RDP + n8n (Windows + Tailscale)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"   # roda de 6 em 6 horas para renovar sessão
+    - cron: "0 */6 * * *"   # opcional: auto-rodar a cada 6h
 
 concurrency:
   group: rdp-n8n-persistente
@@ -12,25 +12,22 @@ concurrency:
 jobs:
   secure-rdp-and-n8n:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 360   # 6h é o limite do runner hosted
 
     steps:
-      # ---------- Tailscale state (ARTIFACT) ----------
-      - name: Restore Tailscale state (artifact)
-        uses: actions/download-artifact@v4
+      #######################################################################
+      # 0) Restaurar state do Tailscale (cache)
+      #######################################################################
+      - name: Restore Tailscale state (cache)
+        uses: actions/cache/restore@v4
+        continue-on-error: true
         with:
-          name: tailscale-state
-          path: C:\
-        continue-on-error: true   # primeira vez não existe, tudo bem
+          path: C:\tailscale.state
+          key: tailscale-state-v1
 
-      - name: Ensure state file exists
-        shell: pwsh
-        run: |
-          if (-not (Test-Path 'C:\tailscale.state')) {
-            New-Item -ItemType File -Path 'C:\tailscale.state' | Out-Null
-          }
-
-      # ---------- RDP / Firewall ----------
+      #######################################################################
+      # 1) RDP básico + firewall porta 3389
+      #######################################################################
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
@@ -41,7 +38,10 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update local RDP user
+      #######################################################################
+      # 2) Criar/atualizar usuário RDP com senha forte
+      #######################################################################
+      - name: Create/Update RDP user
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.Security
@@ -50,13 +50,16 @@ jobs:
           $Number  = [char[]](48..57)
           $Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           $raw = @()
-          $raw += $Upper   | Get-Random -Count 4
-          $raw += $Lower   | Get-Random -Count 4
-          $raw += $Number  | Get-Random -Count 4
-          $raw += $Special | Get-Random -Count 4
+          $raw += $Upper | Get-Random -Count 4
+          $raw += $Lower | Get-Random -Count 4
+          $raw += $Number| Get-Random -Count 4
+          $raw += $Special| Get-Random -Count 4
           $pwd = -join ($raw | Sort-Object { Get-Random })
-          $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
 
+          # Mascara a senha nos logs
+          Write-Output "::add-mask::$pwd"
+
+          $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires
           } else {
@@ -65,10 +68,14 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
 
+          "RDP_USER=RDP"                  | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RDP_PASS=$pwd"                 | Out-File -FilePath $env:GITHUB_ENV -Append
           "RDP_CREDS=User: RDP | Password: $pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # ---------- Tailscale ----------
-      - name: Install Tailscale (MSI)
+      #######################################################################
+      # 3) Instalar Tailscale (MSI)
+      #######################################################################
+      - name: Install Tailscale
         shell: pwsh
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -77,12 +84,19 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Tailscale up (reuse state)
+      #######################################################################
+      # 4) Subir Tailscale com state fixo + hostname fixo + capturar IP
+      #######################################################################
+      - name: Establish Tailscale Connection
         shell: pwsh
         env:
           TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path "C:\tailscale.state")) {
+            New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null
+          }
+
           & $ts up `
             --authkey="$env:TS_AUTH" `
             --state="C:\tailscale.state" `
@@ -90,18 +104,23 @@ jobs:
             --accept-dns=true `
             --accept-routes=true
 
-      - name: Debug Tailscale / capture IP
-        id: tsip
-        shell: pwsh
-        run: |
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts status
-          $ip4 = & $ts ip -4
-          "TAILSCALE_IP=$ip4" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "IP: $ip4"
+          # Captura IP v4 e exporta
+          $tsIP = & $ts ip -4
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale IP v4 => $tsIP"
 
-      # ---------- n8n sem Docker (Node) ----------
-      - name: Prepare n8n folder & firewall
+      # Salvar state (não falhar se concorrência travar o cache)
+      - name: Save Tailscale state (cache)
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: C:\tailscale.state
+          key: tailscale-state-v1
+
+      #######################################################################
+      # 5) Preparar pastas do n8n + liberar porta 5678
+      #######################################################################
+      - name: Prepare n8n folder + firewall by port
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "C:\n8n" -ErrorAction SilentlyContinue | Out-Null
@@ -109,21 +128,24 @@ jobs:
           netsh advfirewall firewall delete rule name="n8n-5678" | Out-Null
           netsh advfirewall firewall add rule name="n8n-5678" dir=in action=allow protocol=TCP localport=5678 | Out-Null
 
+      #######################################################################
+      # 6) Escrever .env do n8n (com bind em 0.0.0.0 e seus dados de DB/credenciais)
+      #######################################################################
       - name: Create .env for n8n
         shell: pwsh
         run: |
           $lines = @(
-            'N8N_PORT=5678',
-            'N8N_HOST=0.0.0.0',
-            'N8N_PROTOCOL=http',
-            'N8N_EDITOR_BASE_URL=http://n8n-server.tail255505.ts.net:5678',
             'N8N_BASIC_AUTH_ACTIVE=true',
             'N8N_BASIC_AUTH_USER=n8nadmin',
             'N8N_BASIC_AUTH_PASSWORD=HyIkL9hC0fQtFzN91',
             'N8N_ENCRYPTION_KEY=7e5ba0b2d6a24c4483c891079f5004f4ac6b0e83678648a6b3ed11f3f6abcb56',
             'GENERIC_TIMEZONE=America/Sao_Paulo',
-            # Ajuste o domínio abaixo se o seu tailnet for diferente:
             'WEBHOOK_URL=http://n8n-server.tail255505.ts.net:5678',
+            'N8N_PORT=5678',
+            'N8N_HOST=0.0.0.0',
+            'N8N_PROTOCOL=http',
+            'N8N_USER_FOLDER=C:\n8n',
+            'N8N_DIAGNOSTICS_ENABLED=false',
             'DB_TYPE=postgresdb',
             'DB_POSTGRESDB_HOST=ep-bold-rain-ad0gbdv3-pooler.c-2.us-east-1.aws.neon.tech',
             'DB_POSTGRESDB_PORT=5432',
@@ -131,15 +153,22 @@ jobs:
             'DB_POSTGRESDB_USER=neondb_owner',
             'DB_POSTGRESDB_PASSWORD=npg_7sq8cUgWAmwh',
             'DB_POSTGRESDB_SSL_ENABLED=true',
-            'DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false',
-            'N8N_HOST=0.0.0.0',
-            'N8N_PORT=5678',
-            'N8N_EDITOR_BASE_URL=http://n8n-server.tail255505.ts.net:5678',
-            'N8N_PROTOCOL=http'
+            'DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false'
           )
           Set-Content -Path 'C:\n8n\.env' -Value $lines -Encoding UTF8
           Write-Host 'C:\n8n\.env criado.'
 
+      # (Opcional) Ver o .env nos logs para conferência
+      - name: Show .env (debug)
+        shell: pwsh
+        run: |
+          Write-Host "===== C:\n8n\.env ====="
+          Get-Content -Path 'C:\n8n\.env'
+          Write-Host "======================="
+
+      #######################################################################
+      # 7) Node 20 + n8n global
+      #######################################################################
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
@@ -150,63 +179,70 @@ jobs:
         run: |
           npm install -g n8n
 
-      - name: Start n8n (background)
+      #######################################################################
+      # 8) Liberar o processo node.exe no firewall (além da porta)
+      #######################################################################
+      - name: Allow node.exe in Windows Firewall
         shell: pwsh
         run: |
-          $envFile = "C:\n8n\.env"
-          if (-not (Test-Path $envFile)) { throw "Arquivo .env não encontrado." }
-          (Get-Content $envFile) | ForEach-Object {
-            if ($_ -match '^\s*$' -or $_ -match '^\s*#') { return }
+          $node = (Get-Command node).Source
+          Write-Host "node.exe em: $node"
+          netsh advfirewall firewall delete rule name="Allow node.exe" | Out-Null
+          netsh advfirewall firewall add rule name="Allow node.exe" dir=in action=allow program="$node" enable=yes | Out-Null
+
+      #######################################################################
+      # 9) Subir n8n com pm2 + health-check + netstat
+      #######################################################################
+      - name: Start n8n with pm2 (background + healthcheck)
+        shell: pwsh
+        run: |
+          # Exporta .env para este processo
+          Get-Content -Raw "C:\n8n\.env" | ForEach-Object {
+            if ($_ -match '^\s*#') { return }
+            if ($_ -match '^\s*$') { return }
             $kv = $_.Split('=',2)
             if ($kv.Length -eq 2) { Set-Item -Path "Env:$($kv[0])" -Value $kv[1] }
           }
 
-          # Caminho do n8n.cmd (npm global bin no Windows)
-          $n8nCmd = Join-Path $env:APPDATA 'npm\n8n.cmd'
-          if (-not (Test-Path $n8nCmd)) {
-            $npmBin = (npm bin -g)
-            $n8nCmd = Join-Path $npmBin 'n8n.cmd'
-          }
-          if (-not (Test-Path $n8nCmd)) {
-            Write-Host "Conteúdo de $env:APPDATA\npm:"
-            Get-ChildItem (Join-Path $env:APPDATA 'npm') -ErrorAction SilentlyContinue | Select-Object Name,Length
-            throw "n8n.cmd não encontrado no PATH global do npm."
-          }
+          npm i -g pm2 --location=global
+          pm2 kill | Out-Null
 
-          Start-Process -NoNewWindow -FilePath $n8nCmd -ArgumentList "start" -WorkingDirectory "C:\n8n"
+          $n8nCmd = (Get-Command n8n.cmd -ErrorAction Stop).Source
+          Write-Host "n8n.cmd em: $n8nCmd"
 
-        - name: Health check n8n local
-        shell: pwsh
-        run: |
-          Write-Host "Testando porta 5678 local..."
-          $t = Test-NetConnection -ComputerName 127.0.0.1 -Port 5678
-          $t | Format-List
-          if (-not $t.TcpTestSucceeded) { Write-Error "n8n NÃO está ouvindo localmente na porta 5678"; exit 1 }
+          pm2 start "$n8nCmd" --name n8n -- start
+          pm2 save | Out-Null
+          Start-Sleep -Seconds 6
+
+          # Health local
+          $ok1 = Test-NetConnection -ComputerName 127.0.0.1 -Port 5678
+          Write-Host "Local 127.0.0.1:5678 => TCP: $($ok1.TcpTestSucceeded)"
           try {
-            $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5678 -TimeoutSec 5
-            Write-Host "HTTP local OK -> StatusCode: $($r.StatusCode)"
-          } catch {
-            Write-Warning "Conseguiu abrir TCP, mas HTTP falhou (pode ser só página inicial sem resposta)."
+            $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:5678/healthz" -TimeoutSec 5
+            Write-Host "GET /healthz => $($resp.StatusCode)"
+          } catch { Write-Host "GET /healthz falhou: $($_.Exception.Message)" }
+
+          # Health via Tailscale
+          if ($env:TAILSCALE_IP) {
+            $ok2 = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 5678
+            Write-Host "$env:TAILSCALE_IP:5678 => TCP: $($ok2.TcpTestSucceeded)"
           }
-      # ---------- Keep alive ----------
+
+          Write-Host "== LISTENING (5678) =="
+          netstat -ano | findstr ":5678" | findstr "LISTEN"
+
+      #######################################################################
+      # 10) Manter vivo até o limite (prints a cada 5 min)
+      #######################################################################
       - name: Keep alive (~6h)
         shell: pwsh
         run: |
           Write-Host "`n=== ACCESS INFO ==="
-          Write-Host "RDP  : $env:TAILSCALE_IP:3389 (User: RDP | $env:RDP_CREDS)"
-          Write-Host "n8n  : http://n8n-server.tail255505.ts.net:5678"
+          Write-Host "RDP  -> $env:TAILSCALE_IP:3389  (User: $env:RDP_USER | Password: $env:RDP_PASS)"
+          Write-Host "n8n  -> http://n8n-server.tail255505.ts.net:5678  (ou http://$env:TAILSCALE_IP:5678)"
           Write-Host "=====================`n"
+
           for ($i=0; $i -lt 72; $i++) {
             Write-Host "[$(Get-Date)] Runner ativo. n8n em 5678. Tailscale $env:TAILSCALE_IP"
             Start-Sleep -Seconds 300
           }
-
-      # ---------- Persist Tailscale state ----------
-      - name: Upload Tailscale state (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tailscale-state
-          path: C:\tailscale.state
-          if-no-files-found: warn
-          retention-days: 90
