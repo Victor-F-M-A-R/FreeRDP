@@ -148,6 +148,16 @@ jobs:
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP v4 => $tsIP"
 
+- name: Write RDP creds to file
+   shell: pwsh
+    run: |
+     "Address: $env:TAILSCALE_IP`:3389`nUser: $env:RDP_USER`nPassword: $env:RDP_PASS" | Set-Content rdp.txt
+
+- name: Upload RDP creds (artifact)
+  uses: actions/upload-artifact@v4
+  with:
+    name: rdp-credentials
+    path: rdp.txt
       # 6) Pastas do n8n + liberar porta 5678
       - name: Prepare n8n folder + firewall by port
         shell: pwsh
