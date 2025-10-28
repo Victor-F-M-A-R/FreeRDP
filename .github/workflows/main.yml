@@ -141,15 +141,27 @@ jobs:
       - name: Start n8n (background)
         shell: pwsh
         run: |
-          # Exporta variáveis do .env para o processo do n8n
-          Get-Content "C:\n8n\.env" | ForEach-Object {
-            if ($_ -and ($_ -notmatch '^\s*#')) {
-              $k,$v = $_.Split('=',2)
-              if ($k -and $v) { [Environment]::SetEnvironmentVariable($k, $v) }
+          Get-Content 'C:\n8n\.env' |
+            Where-Object { $_ -and $_ -notmatch '^\s*#' } |
+            ForEach-Object {
+              $k,$v = $_ -split '=', 2
+              [Environment]::SetEnvironmentVariable($k, $v, 'Process')
             }
+          $n8nExe = $null
+          $cmd = Get-Command n8n.cmd -ErrorAction SilentlyContinue
+          if ($cmd) { $n8nExe = $cmd.Source }
+
+          if (-not $n8nExe) {
+            $npmBin = (npm bin -g).Trim()
+            $n8nExe = Join-Path $npmBin 'n8n.cmd'
           }
-          $npmBin = (npm bin -g)
-          Start-Process -NoNewWindow -FilePath "$npmBin\n8n.cmd" -ArgumentList "start" -WorkingDirectory "C:\n8n"
+
+          if (-not (Test-Path $n8nExe)) {
+            Write-Error "n8n.cmd não encontrado. npm bin global: $npmBin"
+            exit 1
+          }
+          Start-Process -NoNewWindow -FilePath $n8nExe -ArgumentList 'start' -WorkingDirectory 'C:\n8n'
+
 
       - name: Keep alive (~6h)
         shell: pwsh
