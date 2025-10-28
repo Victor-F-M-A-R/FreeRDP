@@ -1,10 +1,9 @@
-name: RDP
+name: RDP + n8n (Tailscale IP fixo)
 
 on:
   workflow_dispatch:
-
-   schedule:
-     - cron: "0 */6 * * *"
+  schedule:
+    - cron: "0 */6 * * *"   # roda a cada 6h para renovar/reativar se precisar
 
 concurrency:
   group: rdp-n8n-persistente
@@ -13,16 +12,20 @@ concurrency:
 jobs:
   secure-rdp-and-n8n:
     runs-on: windows-latest
-    timeout-minutes: 360 
+    timeout-minutes: 360
 
     steps:
-
+      # ------------ Tailscale: restaurar estado ------------
+      # No Windows o state fica no AppData local do runner + ProgramData.
       - name: Restore Tailscale state (cache)
         uses: actions/cache/restore@v4
         with:
-          path: C:\tailscale.state
+          path: |
+            C:\Users\runneradmin\AppData\Local\Tailscale
+            C:\ProgramData\Tailscale
           key: tailscale-state-v1
 
+      # ------------ RDP ------------
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
@@ -33,7 +36,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create/Update RDP user
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.Security
@@ -42,10 +45,10 @@ jobs:
           $Number  = [char[]](48..57)
           $Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           $raw = @()
-          $raw += $Upper | Get-Random -Count 4
-          $raw += $Lower | Get-Random -Count 4
-          $raw += $Number| Get-Random -Count 4
-          $raw += $Special| Get-Random -Count 4
+          $raw += $Upper   | Get-Random -Count 4
+          $raw += $Lower   | Get-Random -Count 4
+          $raw += $Number  | Get-Random -Count 4
+          $raw += $Special | Get-Random -Count 4
           $pwd = -join ($raw | Sort-Object { Get-Random })
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
@@ -56,10 +59,8 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           "RDP_CREDS=User: RDP | Password: $pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Username: RDP"
-          Write-Host "Password: $pwd"
 
+      # ------------ Tailscale ------------
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -75,17 +76,16 @@ jobs:
           TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (-not (Test-Path "C:\tailscale.state")) {
-            New-Item -ItemType File -Path "C:\tailscale.state" | Out-Null
-          }
+
+          # Observação: no Windows o cliente salva o estado em AppData/ProgramData.
+          # Usar um auth key REUTILIZÁVEL (não-ephemeral) com o MESMO hostname
+          # faz o nó reaparecer e manter o mesmo IP.
           & $ts up `
             --authkey="$env:TS_AUTH" `
-            --state="C:\tailscale.state" `
             --hostname="n8n-server" `
             --accept-dns=true `
             --accept-routes=true
 
-          # Capturar IP e exibir
           $tsIP = & $ts ip -4
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP: $tsIP"
@@ -93,17 +93,19 @@ jobs:
       - name: Save Tailscale state (cache)
         uses: actions/cache/save@v4
         with:
-          path: C:\tailscale.state
+          path: |
+            C:\Users\runneradmin\AppData\Local\Tailscale
+            C:\ProgramData\Tailscale
           key: tailscale-state-v1
 
-      - name: Prepare n8n folder and firewall
+      # ------------ n8n ------------
+      - name: Prepare n8n folder + firewall
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "C:\n8n" -ErrorAction SilentlyContinue | Out-Null
           New-Item -ItemType Directory -Path "C:\n8n\data" -ErrorAction SilentlyContinue | Out-Null
           netsh advfirewall firewall delete rule name="n8n-5678" | Out-Null
           netsh advfirewall firewall add rule name="n8n-5678" dir=in action=allow protocol=TCP localport=5678 | Out-Null
-
 
       - name: Create .env for n8n
         shell: pwsh
@@ -127,47 +129,34 @@ jobs:
           Set-Content -Path 'C:\n8n\.env' -Value $lines -Encoding UTF8
           Write-Host 'C:\n8n\.env criado.'
 
-DB_TYPE=postgresdb
-DB_POSTGRESDB_HOST=ep-bold-rain-ad0gbdv3-pooler.c-2.us-east-1.aws.neon.tech
-DB_POSTGRESDB_PORT=5432
-DB_POSTGRESDB_DATABASE=neondb
-DB_POSTGRESDB_USER=neondb_owner
-DB_POSTGRESDB_PASSWORD=npg_7sq8cUgWAmwh
-
-
-DB_POSTGRESDB_SSL_ENABLED=true
-DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false
-"@
-          Set-Content -Path "C:\n8n\.env" -Value $envContent -Encoding UTF8
-          Write-Host "C:\n8n\.env criado."
-
-
-      - name: Install Node.js and n8n
+      - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+
       - name: Install n8n globally
         shell: pwsh
-        run: |
-          npm install -g n8n
+        run: npm install -g n8n
 
-      - name: Start n8n
+      - name: Start n8n (background)
         shell: pwsh
         run: |
-          $envVars = Get-Content -Raw "C:\n8n\.env" `
-            | Select-String -Pattern '^[^#\r\n]+' -AllMatches `
-            | ForEach-Object { $_.Matches.Value.Split('=') } `
-            | ForEach-Object { Set-Item -Path "Env:$($_[0])" -Value ($_.Slice(1) -join "=") }
-
-          # inicia em background
-          Start-Process -NoNewWindow -FilePath "n8n.cmd" -ArgumentList "start" -WorkingDirectory "C:\n8n"
+          # Exporta variáveis do .env para o processo do n8n
+          Get-Content "C:\n8n\.env" | ForEach-Object {
+            if ($_ -and ($_ -notmatch '^\s*#')) {
+              $k,$v = $_.Split('=',2)
+              if ($k -and $v) { [Environment]::SetEnvironmentVariable($k, $v) }
+            }
+          }
+          $npmBin = (npm bin -g)
+          Start-Process -NoNewWindow -FilePath "$npmBin\n8n.cmd" -ArgumentList "start" -WorkingDirectory "C:\n8n"
 
       - name: Keep alive (~6h)
         shell: pwsh
         run: |
           Write-Host "`n=== ACCESS INFO ==="
-          Write-Host "RDP -> $env:TAILSCALE_IP:3389 (User: RDP | Password: $env:RDP_CREDS)"
-          Write-Host "n8n -> http://n8n-server.tail255505.ts.net:5678"
+          Write-Host "RDP  -> $env:TAILSCALE_IP:3389 (User: RDP | $env:RDP_CREDS)"
+          Write-Host "n8n  -> http://n8n-server.tail255505.ts.net:5678"
           Write-Host "=====================`n"
           for ($i=0; $i -lt 72; $i++) {
             Write-Host "[$(Get-Date)] Runner ativo. n8n em 5678. Tailscale $env:TAILSCALE_IP"
