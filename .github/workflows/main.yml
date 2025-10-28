@@ -71,8 +71,8 @@ jobs:
           "RDP_USER=RDP"                  | Out-File -FilePath $env:GITHUB_ENV -Append
           "RDP_PASS=$pwd"                 | Out-File -FilePath $env:GITHUB_ENV -Append
           "RDP_CREDS=User: RDP | Password: $pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-- name: Sanity check (secrets & rede)
+  
+  name: Sanity check (secrets & rede)
   shell: pwsh
   env:
     TS_AUTH: ${{ secrets.TAILSCALE_AUTH_KEY }}
