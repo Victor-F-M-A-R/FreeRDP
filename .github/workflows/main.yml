@@ -2,7 +2,7 @@ name: RDP
 
 on:
   workflow_dispatch:
-  # Se quiser religar sozinho a cada 6h, descomente abaixo e ajuste
+
    schedule:
      - cron: "0 */6 * * *"
 
@@ -13,17 +13,16 @@ concurrency:
 jobs:
   secure-rdp-and-n8n:
     runs-on: windows-latest
-    timeout-minutes: 360   # ~6h é o limite do Windows runner
+    timeout-minutes: 360 
 
     steps:
-      # 0) Restaurar o state do Tailscale do cache (para manter o mesmo nó/IP)
+
       - name: Restore Tailscale state (cache)
         uses: actions/cache/restore@v4
         with:
           path: C:\tailscale.state
           key: tailscale-state-v1
 
-      # 1) Habilitar RDP e regras de firewall básicas
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
@@ -34,7 +33,6 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Restart-Service -Name TermService -Force
 
-      # 2) Criar usuário RDP (admin) com senha aleatória (mostra no log)
       - name: Create RDP User with Secure Password
         shell: pwsh
         run: |
@@ -62,7 +60,6 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: $pwd"
 
-      # 3) Instalar Tailscale (Windows MSI)
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -72,7 +69,6 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      # 4) Subir Tailscale usando o state do cache (IP/identidade persistem) + hostname fixo
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
@@ -94,14 +90,12 @@ jobs:
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP: $tsIP"
 
-      # 5) Salvar/atualizar o state do Tailscale no cache
       - name: Save Tailscale state (cache)
         uses: actions/cache/save@v4
         with:
           path: C:\tailscale.state
           key: tailscale-state-v1
 
-      # 6) Abrir porta 5678 pro n8n e criar C:\n8n
       - name: Prepare n8n folder and firewall
         shell: pwsh
         run: |
@@ -110,20 +104,29 @@ jobs:
           netsh advfirewall firewall delete rule name="n8n-5678" | Out-Null
           netsh advfirewall firewall add rule name="n8n-5678" dir=in action=allow protocol=TCP localport=5678 | Out-Null
 
-      # 7) Criar o arquivo .env com seus dados (Neon + auth + encryption)
+
       - name: Create .env for n8n
         shell: pwsh
         run: |
-          $envContent = @"
-# n8n
-N8N_BASIC_AUTH_ACTIVE=true
-N8N_BASIC_AUTH_USER=n8nadmin
-N8N_BASIC_AUTH_PASSWORD=HyIkL9hC0fQtFzN91
-N8N_ENCRYPTION_KEY=7e5ba0b2d6a24c4483c891079f5004f4ac6b0e83678648a6b3ed11f3f6abcb56
-GENERIC_TIMEZONE=America/Sao_Paulo
-WEBHOOK_URL=http://n8n-server.tail255505.ts.net:5678
+          $lines = @(
+            'N8N_BASIC_AUTH_ACTIVE=true',
+            'N8N_BASIC_AUTH_USER=n8nadmin',
+            'N8N_BASIC_AUTH_PASSWORD=HyIkL9hC0fQtFzN91',
+            'N8N_ENCRYPTION_KEY=7e5ba0b2d6a24c4483c891079f5004f4ac6b0e83678648a6b3ed11f3f6abcb56',
+            'GENERIC_TIMEZONE=America/Sao_Paulo',
+            'WEBHOOK_URL=http://n8n-server.tail255505.ts.net:5678',
+            'DB_TYPE=postgresdb',
+            'DB_POSTGRESDB_HOST=ep-bold-rain-ad0gbdv3-pooler.c-2.us-east-1.aws.neon.tech',
+            'DB_POSTGRESDB_PORT=5432',
+            'DB_POSTGRESDB_DATABASE=neondb',
+            'DB_POSTGRESDB_USER=neondb_owner',
+            'DB_POSTGRESDB_PASSWORD=npg_7sq8cUgWAmwh',
+            'DB_POSTGRESDB_SSL_ENABLED=true',
+            'DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false'
+          )
+          Set-Content -Path 'C:\n8n\.env' -Value $lines -Encoding UTF8
+          Write-Host 'C:\n8n\.env criado.'
 
-# Postgres (Neon)
 DB_TYPE=postgresdb
 DB_POSTGRESDB_HOST=ep-bold-rain-ad0gbdv3-pooler.c-2.us-east-1.aws.neon.tech
 DB_POSTGRESDB_PORT=5432
@@ -131,14 +134,14 @@ DB_POSTGRESDB_DATABASE=neondb
 DB_POSTGRESDB_USER=neondb_owner
 DB_POSTGRESDB_PASSWORD=npg_7sq8cUgWAmwh
 
-# SSL Neon
+
 DB_POSTGRESDB_SSL_ENABLED=true
 DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false
 "@
           Set-Content -Path "C:\n8n\.env" -Value $envContent -Encoding UTF8
           Write-Host "C:\n8n\.env criado."
 
-      # 8) Instalar Node 20.x e n8n global (sem Docker)
+
       - name: Install Node.js and n8n
         uses: actions/setup-node@v4
         with:
@@ -148,7 +151,6 @@ DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false
         run: |
           npm install -g n8n
 
-      # 9) Iniciar n8n em background carregando o .env
       - name: Start n8n
         shell: pwsh
         run: |
@@ -160,7 +162,6 @@ DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false
           # inicia em background
           Start-Process -NoNewWindow -FilePath "n8n.cmd" -ArgumentList "start" -WorkingDirectory "C:\n8n"
 
-      # 10) Mostrar como acessar e manter job vivo até o limite (~6h)
       - name: Keep alive (~6h)
         shell: pwsh
         run: |
